@@ -4,6 +4,7 @@ from builtins import str as unicode
 
 import argparse
 import sys
+import time
 from obspy.core import Stream, UTCDateTime
 from .algorithm import algorithms
 from .PlotTimeseriesFactory import PlotTimeseriesFactory
@@ -89,28 +90,30 @@ class Controller(object):
                     channels=channels)
         return timeseries
 
-    def _rename_channels(self, timeseries, renames):
-        """Rename trace channel names.
+    def _get_output_gaps(self, options, output_timeseries):
+        """Get gaps in the output data.
 
         Parameters
         ----------
-        timeseries : obspy.core.Stream
-            stream with channels to rename
-        renames : array_like
-            list of channels to rename
-            each list item should be array_like:
-                the first element is the channel to rename,
-                the last element is the new channel name
-
-        Returns
-        -------
-        timeseries : obspy.core.Stream
+        options: dictionary
+            The dictionary of all the command line arguments. Could in theory
+            contain other options passed in by the controller.
+        output_timeseries : obspy.core.Stream
         """
-        for r in renames:
-            from_name, to_name = r[0], r[-1]
-            for t in timeseries.select(channel=from_name):
-                t.stats.channel = to_name
-        return timeseries
+        print('checking gaps', options.starttime, options.endtime,
+            file=sys.stderr)
+        if len(output_timeseries) > 0:
+            # find gaps in output, so they can be updated
+            output_gaps = TimeseriesUtility.get_merged_gaps(
+                    TimeseriesUtility.get_stream_gaps(output_timeseries))
+        else:
+            output_gaps = [[
+                options.starttime,
+                options.endtime,
+                # next sample time not used
+                None
+            ]]
+        return output_gaps
 
     def _get_output_timeseries(self, observatory, channels, starttime,
             endtime):
@@ -138,6 +141,119 @@ class Controller(object):
                 starttime=starttime,
                 endtime=endtime,
                 channels=channels)
+        return timeseries
+
+    def _get_process_times(self, last_gap_time, options):
+        """Get times to use for persistent processes.
+
+        Parameters
+        ----------
+        last_gap_time : obspy.core.UTCDateTime
+            start time of last gap.
+        options : dictionary
+            The dictionary of all the command line arguments. Could in theory
+            contain other options passed in by the controller.
+
+        Returns
+        -------
+        starttime : obspy.core.UTCDateTime
+        endtime : obspy.core.UTCDateTime
+
+        Notes
+        -----
+        Checks if there was a previous gap end time and sets
+            the new start time to it. Otherwise the start time
+            is based upon the specified starttime option.
+        Check that the start time and end time are different.
+            If not, the method waits. (Only used for intervals
+            less than one minute.)
+        """
+        if last_gap_time is None:
+            starttime = options.starttime
+        else:
+            starttime = last_gap_time
+        starttime = UTCDateTime(starttime.year,
+                starttime.month, starttime.day,
+                starttime.hour, starttime.minute)
+        endtime = UTCDateTime()
+        endtime = UTCDateTime(endtime.year, endtime.month, endtime.day,
+                endtime.hour, endtime.minute)
+        while starttime == endtime:
+            print("Waiting...")
+            endtime = UTCDateTime()
+            endtime = UTCDateTime(endtime.year, endtime.month, endtime.day,
+                    endtime.hour, endtime.minute)
+            time.sleep(options.process)
+        return starttime, endtime
+
+    def _process_output_gaps(self, algorithm, input_channels, options,
+            output_gaps, update_count):
+        """Processes gaps in the output data by calling run.
+
+        Parameters
+        ----------
+        algorithm : geomagio.algorithm
+            Algorithm to be run on the time series.
+        input_channels : array_like
+            Channels read in.
+        options : dictionary.
+            The dictionary of all the command line arguments. Could in theory
+            contain other options passed in by the controller.
+        output_gaps : array_like
+            Start and end times of gaps in data.
+        update_count : int
+            Current count number for the run_as_update method.
+        """
+        for output_gap in output_gaps:
+            input_timeseries = self._get_input_timeseries(
+                    observatory=options.observatory,
+                    starttime=output_gap[0],
+                    endtime=output_gap[1],
+                    channels=input_channels)
+            if not algorithm.can_produce_data(
+                    starttime=output_gap[0],
+                    endtime=output_gap[1],
+                    stream=input_timeseries):
+                continue
+            # check for fillable gap at start
+            if output_gap[0] == options.starttime:
+                # found fillable gap at start, recurse to previous interval
+                interval = options.endtime - options.starttime
+                starttime = options.starttime - interval
+                endtime = options.starttime - 1
+                options.starttime = starttime
+                options.endtime = endtime
+                last_gap_time = self.run_as_update(options, update_count + 1)
+            # fill gap
+            options.starttime = output_gap[0]
+            options.endtime = output_gap[1]
+            last_gap_time = output_gap[0]
+            print('processing', options.starttime, options.endtime,
+                file=sys.stderr)
+            self.run(options, input_timeseries)
+            return last_gap_time
+
+    def _rename_channels(self, timeseries, renames):
+        """Rename trace channel names.
+
+        Parameters
+        ----------
+        timeseries : obspy.core.Stream
+            stream with channels to rename
+        renames : array_like
+            list of channels to rename
+            each list item should be array_like:
+                the first element is the channel to rename,
+                the last element is the new channel name
+
+        Returns
+        -------
+        timeseries : obspy.core.Stream
+        """
+        for r in renames:
+            from_name, to_name = r[0], r[-1]
+            for t in timeseries.select(channel=from_name):
+                t.stats.channel = to_name
         return timeseries
 
     def run(self, options, input_timeseries=None):
@@ -185,6 +301,44 @@ class Controller(object):
                 endtime=options.endtime,
                 channels=output_channels)
 
+    def run_as_process(self, options):
+        """Updates data on first run then runs on a shorter interval.
+        Parameters
+        ----------
+        options : dictionary
+            The dictionary of all the command line arguments. Could in theory
+            contain other options passed in by the controller.
+
+        Notes
+        -----
+        Periodically calls run_as_update in order to check if new data is
+            available between the start and endtime Runs algorithms if
+            specified. (Example: --process-algorithms xyz deltaf)
+        """
+        interval = options.process
+        if options.update_limit is 0:
+            options.update_limit = 1
+        last_gap_time = self.run_as_update(options, update_count=0)
+        while True:
+            time.sleep(interval)
+            starttime, endtime = self._get_process_times(last_gap_time,
+                    options)
+            options.starttime = starttime
+            options.endtime = endtime
+            algorithm = self._algorithm
+            input_channels = options.inchannels or \
+                    algorithm.get_input_channels()
+            output_channels = options.outchannels or \
+                    algorithm.get_output_channels()
+            output_timeseries = self._get_output_timeseries(
+                    observatory=options.output_observatory,
+                    starttime=starttime,
+                    endtime=endtime,
+                    channels=output_channels)
+            gaps = self._get_output_gaps(options, output_timeseries)
+            last_gap_time = self._process_output_gaps(algorithm,
+                    input_channels, options, gaps, 0)
+
     def run_as_update(self, options, update_count=0):
         """Updates data.
         Parameters
@@ -208,8 +362,6 @@ class Controller(object):
         if options.update_limit != 0:
             if update_count >= options.update_limit:
                 return
-        print('checking gaps', options.starttime, options.endtime,
-            file=sys.stderr)
         algorithm = self._algorithm
         input_channels = options.inchannels or \
                 algorithm.get_input_channels()
@@ -221,43 +373,10 @@ class Controller(object):
                 starttime=options.starttime,
                 endtime=options.endtime,
                 channels=output_channels)
-        if len(output_timeseries) > 0:
-            # find gaps in output, so they can be updated
-            output_gaps = TimeseriesUtility.get_merged_gaps(
-                    TimeseriesUtility.get_stream_gaps(output_timeseries))
-        else:
-            output_gaps = [[
-                options.starttime,
-                options.endtime,
-                # next sample time not used
-                None
-            ]]
-        for output_gap in output_gaps:
-            input_timeseries = self._get_input_timeseries(
-                    observatory=options.observatory,
-                    starttime=output_gap[0],
-                    endtime=output_gap[1],
-                    channels=input_channels)
-            if not algorithm.can_produce_data(
-                    starttime=output_gap[0],
-                    endtime=output_gap[1],
-                    stream=input_timeseries):
-                continue
-            # check for fillable gap at start
-            if output_gap[0] == options.starttime:
-                # found fillable gap at start, recurse to previous interval
-                interval = options.endtime - options.starttime
-                starttime = options.starttime - interval
-                endtime = options.starttime - 1
-                options.starttime = starttime
-                options.endtime = endtime
-                self.run_as_update(options, update_count + 1)
-            # fill gap
-            options.starttime = output_gap[0]
-            options.endtime = output_gap[1]
-            print('processing', options.starttime, options.endtime,
-                file=sys.stderr)
-            self.run(options, input_timeseries)
+        output_gaps = self._get_output_gaps(options, output_timeseries)
+        last_gap_time = self._process_output_gaps(algorithm, input_channels,
+                options, output_gaps, update_count)
+        return last_gap_time
 
 
 def get_input_factory(args):
@@ -357,7 +476,6 @@ def get_output_factory(args):
         output_url = args.output_url
         output_factory_args['urlInterval'] = args.output_url_interval
         output_factory_args['urlTemplate'] = output_url
-
     output_type = args.output
     if output_type == 'edge':
         # TODO: deal with other edge arguments
@@ -518,9 +636,13 @@ def _main(args):
             args.starttime = args.endtime - 3600
         else:
             args.starttime = args.endtime - 600
-
     if args.update:
-        controller.run_as_update(args)
+        last_gap_time = controller.run_as_update(args)
+        if last_gap_time is not None:
+            print('Start time of last gap: ' +
+                    last_gap_time.strftime("%Y-%m-%dT%H:%M:%S.%f"))
+    elif args.process:
+        controller.run_as_process(args)
     else:
         controller.run(args)
 
@@ -602,6 +724,13 @@ def parse_args(args):
     parser.add_argument('--interval',
             default='minute',
             choices=['hourly', 'minute', 'second'])
+    parser.add_argument('--process',
+            type=int,
+            help='Process at an interval.'),
+    parser.add_argument('--process-algorithms',
+            nargs='+',
+            choices=[k for k in algorithms],
+            help='Algorithms to run in the process.')
     parser.add_argument('--update',
             action='store_true',
             default=False,
